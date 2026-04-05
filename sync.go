@@ -321,7 +321,7 @@ func (repo *Repo) sync0(context map[string]interface{},
 			if gulu.Str.Contains(cloudUpsert.ID, fetchedFileIDs) {
 				// 发生实际下载文件的情况，尝试解决冲突
 
-				if repo.ignoreLocalUpsert(localUpsert, latestSyncFiles, nowStr, context) {
+				if repo.ignoreLocalUpsert(localUpsert, cloudUpsert, latestSyncFiles, nowStr, context) {
 					// 如果能忽略本地变更的话则不算做冲突，进行正常合并
 					mergeResult.Upserts = append(mergeResult.Upserts, cloudUpsert)
 					logging.LogInfof("sync merge upsert [%s, %s, %s]", cloudUpsert.ID, cloudUpsert.Path, time.UnixMilli(cloudUpsert.Updated).Format("2006-01-02 15:04:05"))
@@ -451,14 +451,16 @@ func (repo *Repo) sync0(context map[string]interface{},
 	return
 }
 
-func (repo *Repo) ignoreLocalUpsert(localUpsert *entity.File, latestSyncFiles []*entity.File, now string, context map[string]interface{}) bool {
+func (repo *Repo) ignoreLocalUpsert(localUpsert *entity.File, cloudUpsert *entity.File, latestSyncFiles []*entity.File, now string, context map[string]interface{}) bool {
 	if !strings.HasSuffix(localUpsert.Path, ".sy") {
 		return false // 非 .sy 文件目前不做内容对比，直接认为本地 upsert 是最新的
 	}
 
 	latestSyncFile := repo.getFile(latestSyncFiles, localUpsert)
 	if nil == latestSyncFile {
-		return false // 本地 upsert 是新增的文件
+		// 本地 upsert 是新增的文件，尝试比较本地和云端的内容来解决冲突
+		// 优化多设备同时新建同一文件（如每日日记）导致冲突的问题 https://github.com/siyuan-note/siyuan/issues/13795
+		return repo.isLocalNewUpsertIgnorable(localUpsert, cloudUpsert, now, context)
 	}
 
 	// 如果是变更 .sy 文件则需要解析并进行内容对比
@@ -537,6 +539,76 @@ func onlyChangeFoldIAL(n1, n2 *ast.Node) bool {
 		}
 	}
 	return true
+}
+
+// isLocalNewUpsertIgnorable 比较本地和云端新增的 .sy 文件内容，如果本地内容可以被云端版本覆盖则返回 true。
+// 这用于解决多设备同时新建同一文件（如每日日记）导致冲突的问题。
+func (repo *Repo) isLocalNewUpsertIgnorable(localUpsert, cloudUpsert *entity.File, now string, context map[string]interface{}) bool {
+	luteEngine := lute.New()
+	localTemp := filepath.Join(repo.TempPath, "repo", "sync", "resolves", now, "local")
+	cloudTemp := filepath.Join(repo.TempPath, "repo", "sync", "resolves", now, "cloud")
+
+	localTree, err := repo.checkoutTree(localUpsert, localTemp, luteEngine, context)
+	if nil != err {
+		logging.LogWarnf("checkout local tree failed when comparing new upserts: %s", err)
+		return false
+	}
+	cloudTree, err := repo.checkoutTree(cloudUpsert, cloudTemp, luteEngine, context)
+	if nil != err {
+		logging.LogWarnf("checkout cloud tree failed when comparing new upserts: %s", err)
+		return false
+	}
+
+	// 收集本地内容块（排除文档节点）
+	localBlocks := map[string]*ast.Node{}
+	ast.Walk(localTree.Root, func(node *ast.Node, entering bool) ast.WalkStatus {
+		if !entering || !node.IsBlock() || ast.NodeDocument == node.Type {
+			return ast.WalkContinue
+		}
+		localBlocks[node.ID] = node
+		return ast.WalkContinue
+	})
+
+	// 收集云端内容块（排除文档节点）
+	cloudBlocks := map[string]*ast.Node{}
+	ast.Walk(cloudTree.Root, func(node *ast.Node, entering bool) ast.WalkStatus {
+		if !entering || !node.IsBlock() || ast.NodeDocument == node.Type {
+			return ast.WalkContinue
+		}
+		cloudBlocks[node.ID] = node
+		return ast.WalkContinue
+	})
+
+	// 如果本地没有内容块或所有块内容为空，则接受云端版本
+	localHasContent := false
+	for _, node := range localBlocks {
+		if strings.TrimSpace(node.Content()) != "" {
+			localHasContent = true
+			break
+		}
+	}
+	if !localHasContent {
+		logging.LogInfof("ignored local new upsert [%s] because local has no content", localUpsert.Path)
+		return true
+	}
+
+	// 如果本地和云端块数量相同且所有块都匹配，则接受云端版本
+	if len(localBlocks) == len(cloudBlocks) {
+		allSame := true
+		for id, localNode := range localBlocks {
+			cloudNode, ok := cloudBlocks[id]
+			if !ok || localNode.Type != cloudNode.Type || localNode.Content() != cloudNode.Content() {
+				allSame = false
+				break
+			}
+		}
+		if allSame {
+			logging.LogInfof("ignored local new upsert [%s] because content is identical to cloud", localUpsert.Path)
+			return true
+		}
+	}
+
+	return false
 }
 
 func (repo *Repo) checkoutTree(file *entity.File, checkoutDir string, luteEngine *lute.Lute, context map[string]interface{}) (ret *parse.Tree, err error) {

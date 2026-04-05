@@ -580,6 +580,10 @@ func (repo *Repo) isLocalNewUpsertIgnorable(localUpsert, cloudUpsert *entity.Fil
 	})
 
 	// 如果本地没有内容块或所有块内容为空，则接受云端版本
+	if len(localBlocks) == 0 {
+		logging.LogInfof("ignored local new upsert [%s] because local has no content blocks", localUpsert.Path)
+		return true
+	}
 	localHasContent := false
 	for _, node := range localBlocks {
 		if strings.TrimSpace(node.Content()) != "" {
@@ -588,7 +592,7 @@ func (repo *Repo) isLocalNewUpsertIgnorable(localUpsert, cloudUpsert *entity.Fil
 		}
 	}
 	if !localHasContent {
-		logging.LogInfof("ignored local new upsert [%s] because local has no content", localUpsert.Path)
+		logging.LogInfof("ignored local new upsert [%s] because all local content blocks are empty", localUpsert.Path)
 		return true
 	}
 

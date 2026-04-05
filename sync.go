@@ -51,6 +51,15 @@ var (
 	ErrCloudGenerateConflictHistory = errors.New("generate conflict history failed")
 )
 
+// mergeAction 表示同步合并时的操作。
+type mergeAction int
+
+const (
+	mergeConflict    mergeAction = iota // 冲突
+	mergeAcceptCloud                    // 忽略本地变更，接受云端版本
+	mergeKeepLocal                      // 忽略云端变更，保留本地版本
+)
+
 type MergeResult struct {
 	Time                        time.Time
 	Upserts, Removes, Conflicts []*entity.File
@@ -321,10 +330,16 @@ func (repo *Repo) sync0(context map[string]interface{},
 			if gulu.Str.Contains(cloudUpsert.ID, fetchedFileIDs) {
 				// 发生实际下载文件的情况，尝试解决冲突
 
-				if repo.ignoreLocalUpsert(localUpsert, cloudUpsert, latestSyncFiles, nowStr, context) {
-					// 如果能忽略本地变更的话则不算做冲突，进行正常合并
+				action := repo.ignoreLocalUpsert(localUpsert, cloudUpsert, latestSyncFiles, nowStr, context)
+				if mergeAcceptCloud == action {
+					// 忽略本地变更，接受云端版本进行正常合并
 					mergeResult.Upserts = append(mergeResult.Upserts, cloudUpsert)
 					logging.LogInfof("sync merge upsert [%s, %s, %s]", cloudUpsert.ID, cloudUpsert.Path, time.UnixMilli(cloudUpsert.Updated).Format("2006-01-02 15:04:05"))
+					continue
+				}
+				if mergeKeepLocal == action {
+					// 忽略云端变更，保留本地版本，不算冲突
+					logging.LogInfof("sync merge keep local [%s, %s, %s]", localUpsert.ID, localUpsert.Path, time.UnixMilli(localUpsert.Updated).Format("2006-01-02 15:04:05"))
 					continue
 				}
 
@@ -451,16 +466,16 @@ func (repo *Repo) sync0(context map[string]interface{},
 	return
 }
 
-func (repo *Repo) ignoreLocalUpsert(localUpsert *entity.File, cloudUpsert *entity.File, latestSyncFiles []*entity.File, now string, context map[string]interface{}) bool {
+func (repo *Repo) ignoreLocalUpsert(localUpsert *entity.File, cloudUpsert *entity.File, latestSyncFiles []*entity.File, now string, context map[string]interface{}) mergeAction {
 	if !strings.HasSuffix(localUpsert.Path, ".sy") {
-		return false // 非 .sy 文件目前不做内容对比，直接认为本地 upsert 是最新的
+		return mergeConflict // 非 .sy 文件目前不做内容对比，直接认为本地 upsert 是最新的
 	}
 
 	latestSyncFile := repo.getFile(latestSyncFiles, localUpsert)
 	if nil == latestSyncFile {
 		// 本地 upsert 是新增的文件，尝试比较本地和云端的内容来解决冲突
 		// 优化多设备同时新建同一文件（如每日日记）导致冲突的问题 https://github.com/siyuan-note/siyuan/issues/13795
-		return repo.isLocalNewUpsertIgnorable(localUpsert, cloudUpsert, now, context)
+		return repo.resolveNewUpsertConflict(localUpsert, cloudUpsert, now, context)
 	}
 
 	// 如果是变更 .sy 文件则需要解析并进行内容对比
@@ -469,11 +484,11 @@ func (repo *Repo) ignoreLocalUpsert(localUpsert *entity.File, cloudUpsert *entit
 	temp := filepath.Join(repo.TempPath, "repo", "sync", "resolves", now)
 	localTree, err := repo.checkoutTree(localUpsert, temp, luteEngine, context)
 	if nil != err {
-		return false
+		return mergeConflict
 	}
 	localLastSyncTree, err := repo.checkoutTree(latestSyncFile, temp, luteEngine, context)
 	if nil != err {
-		return false
+		return mergeConflict
 	}
 
 	localNodes, localLastSyncNodes := map[string]*ast.Node{}, map[string]*ast.Node{}
@@ -495,20 +510,20 @@ func (repo *Repo) ignoreLocalUpsert(localUpsert *entity.File, cloudUpsert *entit
 	})
 
 	if len(localNodes) != len(localLastSyncNodes) {
-		return false // 本地变更导致块数量不相同
+		return mergeConflict // 本地变更导致块数量不相同
 	}
 
 	for id, localNode := range localNodes {
 		if lastSyncNode, ok := localLastSyncNodes[id]; !ok || localNode.ID != lastSyncNode.ID || localNode.Type != lastSyncNode.Type {
-			return false // 本地变更导致块不相同
+			return mergeConflict // 本地变更导致块不相同
 		}
 
 		localLastSyncNode := localLastSyncNodes[id]
 		if !onlyChangeFoldIAL(localNode, localLastSyncNode) {
-			return false // 本地变更导致块不相同
+			return mergeConflict // 本地变更导致块不相同
 		}
 	}
-	return true // 本地仅变更了折叠属性，并且云端也有更新的 upsert，所以忽略本地的折叠变更
+	return mergeAcceptCloud // 本地仅变更了折叠属性，并且云端也有更新的 upsert，所以忽略本地的折叠变更
 }
 
 func onlyChangeFoldIAL(n1, n2 *ast.Node) bool {
@@ -541,9 +556,13 @@ func onlyChangeFoldIAL(n1, n2 *ast.Node) bool {
 	return true
 }
 
-// isLocalNewUpsertIgnorable 比较本地和云端新增的 .sy 文件内容，如果本地内容可以被云端版本覆盖则返回 true。
+// resolveNewUpsertConflict 比较本地和云端新增的 .sy 文件内容，返回合并操作。
 // 这用于解决多设备同时新建同一文件（如每日日记）导致冲突的问题。
-func (repo *Repo) isLocalNewUpsertIgnorable(localUpsert, cloudUpsert *entity.File, now string, context map[string]interface{}) bool {
+//   - 一方为空或仅有空白内容时，接受有内容的一方，不算冲突
+//   - 双方内容一致时，接受云端版本，不算冲突
+//   - 双方仅有空白行差异时，接受云端版本，不算冲突
+//   - 其他情况视为冲突
+func (repo *Repo) resolveNewUpsertConflict(localUpsert, cloudUpsert *entity.File, now string, context map[string]interface{}) mergeAction {
 	luteEngine := lute.New()
 	localTemp := filepath.Join(repo.TempPath, "repo", "sync", "resolves", now, "local")
 	cloudTemp := filepath.Join(repo.TempPath, "repo", "sync", "resolves", now, "cloud")
@@ -551,12 +570,12 @@ func (repo *Repo) isLocalNewUpsertIgnorable(localUpsert, cloudUpsert *entity.Fil
 	localTree, err := repo.checkoutTree(localUpsert, localTemp, luteEngine, context)
 	if nil != err {
 		logging.LogWarnf("checkout local tree failed when comparing new upserts: %s", err)
-		return false
+		return mergeConflict
 	}
 	cloudTree, err := repo.checkoutTree(cloudUpsert, cloudTemp, luteEngine, context)
 	if nil != err {
 		logging.LogWarnf("checkout cloud tree failed when comparing new upserts: %s", err)
-		return false
+		return mergeConflict
 	}
 
 	// 收集本地内容块（排除文档节点）
@@ -579,40 +598,61 @@ func (repo *Repo) isLocalNewUpsertIgnorable(localUpsert, cloudUpsert *entity.Fil
 		return ast.WalkContinue
 	})
 
-	// 如果本地没有内容块或所有块内容为空，则接受云端版本
-	if len(localBlocks) == 0 {
-		logging.LogInfof("ignored local new upsert [%s] because local has no content blocks", localUpsert.Path)
-		return true
-	}
-	localHasContent := false
-	for _, node := range localBlocks {
-		if strings.TrimSpace(node.Content()) != "" {
-			localHasContent = true
-			break
-		}
-	}
+	localHasContent := hasNonBlankContent(localBlocks)
+	cloudHasContent := hasNonBlankContent(cloudBlocks)
+
+	// 如果本地没有实际内容（空白或仅有空行），则接受云端版本
 	if !localHasContent {
-		logging.LogInfof("ignored local new upsert [%s] because all local content blocks are empty", localUpsert.Path)
-		return true
+		logging.LogInfof("ignored local new upsert [%s] because local has no meaningful content", localUpsert.Path)
+		return mergeAcceptCloud
 	}
 
-	// 如果本地和云端块数量相同且所有块都匹配，则接受云端版本
-	if len(localBlocks) == len(cloudBlocks) {
+	// 如果云端没有实际内容（空白或仅有空行），则保留本地版本，不算冲突
+	if !cloudHasContent {
+		logging.LogInfof("ignored cloud new upsert [%s] because cloud has no meaningful content", cloudUpsert.Path)
+		return mergeKeepLocal
+	}
+
+	// 双方都有实际内容，比较非空白块是否一致
+	localNonBlank := getNonBlankBlocks(localBlocks)
+	cloudNonBlank := getNonBlankBlocks(cloudBlocks)
+	if len(localNonBlank) == len(cloudNonBlank) {
 		allSame := true
-		for id, localNode := range localBlocks {
-			cloudNode, ok := cloudBlocks[id]
+		for id, localNode := range localNonBlank {
+			cloudNode, ok := cloudNonBlank[id]
 			if !ok || localNode.Type != cloudNode.Type || localNode.Content() != cloudNode.Content() {
 				allSame = false
 				break
 			}
 		}
 		if allSame {
-			logging.LogInfof("ignored local new upsert [%s] because content is identical to cloud", localUpsert.Path)
-			return true
+			logging.LogInfof("ignored local new upsert [%s] because non-blank content is identical to cloud", localUpsert.Path)
+			return mergeAcceptCloud
 		}
 	}
 
+	return mergeConflict
+}
+
+// hasNonBlankContent 检查块集合中是否有非空白内容。
+func hasNonBlankContent(blocks map[string]*ast.Node) bool {
+	for _, node := range blocks {
+		if strings.TrimSpace(node.Content()) != "" {
+			return true
+		}
+	}
 	return false
+}
+
+// getNonBlankBlocks 返回块集合中所有有非空白内容的块。
+func getNonBlankBlocks(blocks map[string]*ast.Node) map[string]*ast.Node {
+	ret := map[string]*ast.Node{}
+	for id, node := range blocks {
+		if strings.TrimSpace(node.Content()) != "" {
+			ret[id] = node
+		}
+	}
+	return ret
 }
 
 func (repo *Repo) checkoutTree(file *entity.File, checkoutDir string, luteEngine *lute.Lute, context map[string]interface{}) (ret *parse.Tree, err error) {
